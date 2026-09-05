@@ -1,0 +1,80 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
+	"github.com/cilium/ebpf/rlimit"
+)
+
+// Represents the event emitted from kernel space
+type PacketEvent struct {
+	SrcIP     uint32
+	DstIP     uint32
+	SrcPort   uint16
+	DstPort   uint16
+	TCPWindow uint16
+	Timestamp uint64
+}
+
+func main() {
+	// Remove memory limits for eBPF allocations
+	if err := rlimit.RemoveMemlock(); err != nil {
+		log.Fatalf("Failed to remove memlock: %v", err)
+	}
+
+	// Load precompiled BPF objects (generated via bpf2go)
+	objs := ghostgateObjects{}
+	if err := loadGhostgateObjects(&objs, nil); err != nil {
+		log.Fatalf("Loading eBPF objects failed: %v", err)
+	}
+	defer objs.Close()
+
+	// Attach XDP program to network interface (e.g., eth0)
+	iface, err := net.InterfaceByName("eth0")
+	if err != nil {
+		log.Fatalf("Interface error: %v", err)
+	}
+
+	l, err := link.AttachXDP(link.XDPOptions{
+		Program:   objs.GhostgateFilter,
+		Interface: iface.Index,
+	})
+	if err != nil {
+		log.Fatalf("Could not attach XDP: %v", err)
+	}
+	defer l.Close()
+
+	fmt.Println("GhostGate XDP filter active on eth0. Reading telemetry...")
+
+	// Listen to the ring buffer
+	rd, err := ringbuf.NewReader(objs.FlowEvents)
+	if err != nil {
+		log.Fatalf("RingBuffer setup failed: %v", err)
+	}
+	defer rd.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		for {
+			record, err := rd.Read()
+			if err != nil {
+				return
+			}
+			// Process packet timing, jitter, and trigger an automated ban
+			fmt.Printf("Telemetry frame received: %d bytes\n", len(record.RawSample))
+		}
+	}()
+
+	<-ctx.Done()
+	fmt.Println("Detaching GhostGate...")
+}
